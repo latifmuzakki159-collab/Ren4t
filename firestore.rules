@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) { return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    function isValidCharacter(data) {
+      return data.keys().hasAll(['id', 'name', 'description', 'personality', 'firstMessage', 'avatarUrl']) &&
+             data.id is string && data.id.size() <= 128 &&
+             data.name is string && data.name.size() <= 500 &&
+             data.description is string && data.description.size() <= 100000 &&
+             data.personality is string && data.personality.size() <= 100000 &&
+             data.firstMessage is string && data.firstMessage.size() <= 100000 &&
+             data.avatarUrl is string && data.avatarUrl.size() <= 2000;
+      // We allow other fields via loose schema or we can be strict. The user app is an AI RP without strict validation, but let's be strict enough.
+    }
+
+    match /houses/{houseId} {
+      match /characters/{characterId} {
+        allow read: if isValidId(houseId);
+        allow create: if isValidId(houseId) && isValidId(characterId) && isValidCharacter(incoming());
+        allow update: if isValidId(houseId) && isValidCharacter(incoming());
+        allow delete: if isValidId(houseId);
+      }
+      match /chats/{characterId}/messages/{messageId} {
+        allow read: if isValidId(houseId);
+        allow create: if isValidId(houseId) && isValidId(characterId) && isValidId(messageId) && incoming().id is string && incoming().role is string && incoming().content is string;
+        allow update: if isValidId(houseId) && incoming().id is string && incoming().role is string && incoming().content is string;
+        allow delete: if isValidId(houseId);
+      }
+      match /summaries/{characterId} {
+        allow read: if isValidId(houseId);
+        allow create, update: if isValidId(houseId) && isValidId(characterId) && incoming().content is string && incoming().messageCount is number;
+        allow delete: if isValidId(houseId);
+      }
+      match /settings/main {
+        allow read: if isValidId(houseId);
+        allow create, update: if isValidId(houseId) && incoming().model is string;
+        allow delete: if isValidId(houseId);
+      }
+    }
+  }
+}

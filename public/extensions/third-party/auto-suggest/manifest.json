@@ -1,0 +1,9 @@
+{
+  "name": "AI Auto-Suggest Box",
+  "version": "1.0.0",
+  "description": "Menganalisis pesan terakhir karakter dan otomatis merender 3 rekomendasi aksi atau dialog di bawah obrolan menggunakan Gemini AI.",
+  "author": "GeminiRP Core",
+  "js": "index.js",
+  "css": "style.css",
+  "loading_order": 5
+}

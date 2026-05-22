@@ -1,0 +1,9 @@
+{
+  "name": "RP Style Booster",
+  "version": "1.0.0",
+  "description": "Menyediakan pengubah gaya bahasa (Modern, Sastra, Dramatis) untuk memperkaya dialog yang Anda tulis sebelum dikirim ke AI.",
+  "author": "GeminiRP Core",
+  "js": "index.js",
+  "css": "style.css",
+  "loading_order": 6
+}

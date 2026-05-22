@@ -1,0 +1,126 @@
+{
+  "entities": {
+    "Character": {
+      "title": "Character",
+      "description": "A roleplay character definition.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "personality": { "type": "string" },
+        "firstMessage": { "type": "string" },
+        "avatarUrl": { "type": "string" },
+        "scenario": { "type": "string" },
+        "lorebook": {
+          "type": "array",
+          "items": { "$ref": "#/entities/LorebookEntry" }
+        }
+      },
+      "required": ["id", "name", "description", "personality", "firstMessage", "avatarUrl"]
+    },
+    "LorebookEntry": {
+      "title": "LorebookEntry",
+      "description": "Lorebook entries.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "keys": { "type": "array", "items": { "type": "string" } },
+        "secondaryKeys": { "type": "array", "items": { "type": "string" } },
+        "entry": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "alwaysOn": { "type": "boolean" }
+      },
+      "required": ["id", "keys", "entry", "enabled"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A chat message.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "content": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "candidates": { "type": "array", "items": { "type": "string" } },
+        "currentIndex": { "type": "number" },
+        "thought": { "type": "string" },
+        "thoughts": { "type": "array", "items": { "type": "string" } },
+        "isThoughtExpanded": { "type": "boolean" },
+        "parentId": { "type": ["string", "null"] },
+        "childrenIds": { "type": "array", "items": { "type": "string" } },
+        "branchId": { "type": "string" },
+        "activeLoreIds": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "role", "content", "timestamp"]
+    },
+    "ChatSummary": {
+      "title": "ChatSummary",
+      "description": "Summary of a character chat.",
+      "type": "object",
+      "properties": {
+        "content": { "type": "string" },
+        "messageCount": { "type": "number" }
+      },
+      "required": ["content", "messageCount"]
+    },
+    "AppSettings": {
+      "title": "AppSettings",
+      "description": "Global Settings for the House.",
+      "type": "object",
+      "properties": {
+        "model": { "type": "string" },
+        "systemPrompt": { "type": "string" },
+        "promptEntries": { "type": "array", "items": { "$ref": "#/entities/PromptEntry" } },
+        "contextLimit": { "type": "number" },
+        "temperature": { "type": "number" },
+        "userName": { "type": "string" },
+        "serviceProvider": { "type": "string" },
+        "sumoPodApiKey": { "type": "string" },
+        "electronHubApiKey": { "type": "string" },
+        "glmApiKey": { "type": "string" },
+        "byteplusApiKey": { "type": "string" },
+        "nvidiaApiKey": { "type": "string" },
+        "customApiKey": { "type": "string" },
+        "customEndpoint": { "type": "string" },
+        "bridgeEnabled": { "type": "boolean" },
+        "bridgeUrl": { "type": "string" },
+        "bridgeSessionId": { "type": "string" }
+      },
+      "required": ["model", "systemPrompt", "contextLimit", "temperature", "userName", "serviceProvider", "bridgeEnabled", "bridgeUrl", "bridgeSessionId"]
+    },
+    "PromptEntry": {
+      "title": "PromptEntry",
+      "description": "A system prompt configuration entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "content": { "type": "string" },
+        "role": { "type": "string" },
+        "enabled": { "type": "boolean" },
+        "injectionPosition": { "type": "number" },
+        "injectionDepth": { "type": "number" }
+      },
+      "required": ["id", "name", "content", "role", "enabled"]
+    }
+  },
+  "firestore": {
+    "/houses/{houseId}/characters/{characterId}": {
+      "schema": { "$ref": "#/entities/Character" },
+      "description": "The characters owned by the given house."
+    },
+    "/houses/{houseId}/chats/{characterId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/Message" },
+      "description": "The messages in a specific character chat."
+    },
+    "/houses/{houseId}/summaries/{characterId}": {
+      "schema": { "$ref": "#/entities/ChatSummary" },
+      "description": "The chat summary for a specific character."
+    },
+    "/houses/{houseId}/settings/main": {
+      "schema": { "$ref": "#/entities/AppSettings" },
+      "description": "The global settings for the house."
+    }
+  }
+}

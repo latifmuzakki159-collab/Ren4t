@@ -1,0 +1,1412 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import { AppSettings, Character, Message, LorebookEntry } from '../types';
+import { loadCharacters, loadChat, saveChat, saveCharacters, loadChatSummary, saveChatSummary, ChatSummary, deleteChat, deleteMessage } from '../utils/storage';
+import { generateReply, extractNewLore, makeLLMRequest } from '../services/geminiService';
+import { parseJSONL, parseTextChat, exportToJSONL, exportToText } from '../utils/parsers';
+import LorebookModal from '../components/LorebookModal';
+import CollaborativeBridge from '../components/CollaborativeBridge';
+import ConfirmModal from '../components/ConfirmModal';
+import { globalEventBus, EVENT_TYPES } from '../utils/eventBus';
+import { syncActiveChatContext, initExtensionSystem } from '../utils/extensionLoader';
+
+interface Props {
+  settings: AppSettings;
+}
+
+const uuid = () => Date.now().toString(36) + Math.random().toString(36).substr(2);
+
+// --- HELPER: Parse Thought ---
+const parseThoughtAndContent = (rawText: string): { content: string, thought: string } => {
+    // Regex to capture content inside <think>...</think> (case insensitive, multiline)
+    const thinkRegex = /<think>([\s\S]*?)<\/think>/i;
+    const match = rawText.match(thinkRegex);
+
+    if (match) {
+        let thought = match[1].trim();
+        let content = rawText.replace(thinkRegex, '').trim();
+        
+        if (content === '' && thought !== '') {
+            content = "[Peringatan: Model hanya menghasilkan proses berpikir (think), ini biasanya karena token limit (max_tokens). Cobalah perbesar maxOutputTokens di Settings atau suruh 'Lanjutkan'.]";
+        }
+        return { content, thought };
+    }
+
+    // Check if there's an unclosed <think> tag (hit max tokens before closing)
+    const unclosedThinkRegex = /<think>([\s\S]*)/i;
+    const unclosedMatch = rawText.match(unclosedThinkRegex);
+    if (unclosedMatch) {
+        return { 
+            content: "[Peringatan: Proses berpikir model terpotong di tengah jalan karena token limit. Perbesar nilai max_tokens di pengaturan.]", 
+            thought: unclosedMatch[1].trim() 
+        };
+    }
+
+    return { content: rawText, thought: '' };
+};
+
+const ChatPage: React.FC<Props> = ({ settings }) => {
+  const { charId } = useParams<{ charId: string }>();
+  const [character, setCharacter] = useState<Character | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [view, setView] = useState<'landing' | 'chat'>('landing');
+  const [hasHistory, setHasHistory] = useState(false);
+  
+  // UI States
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const isLoadingRef = useRef(false);
+  const [showAdvancedControls, setShowAdvancedControls] = useState(true); // Default ON, toggleable
+  const [showMenu, setShowMenu] = useState(false);
+  const [isLorebookOpen, setIsLorebookOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editContent, setEditContent] = useState('');
+  
+  // Modals state
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [msgToDelete, setMsgToDelete] = useState<string | null>(null);
+  const [visibleLoreMsgId, setVisibleLoreMsgId] = useState<string | null>(null);
+  const [newLoreNotification, setNewLoreNotification] = useState<boolean>(false);
+  const [suggestedLores, setSuggestedLores] = useState<LorebookEntry[]>([]);
+  const [showSuggestedLoreModal, setShowSuggestedLoreModal] = useState(false);
+  const [downloadLink, setDownloadLink] = useState<{ url: string, filename: string, content: string } | null>(null);
+
+  // Summary State
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [summaryMsgCount, setSummaryMsgCount] = useState<number>(10);
+  const [summaryContent, setSummaryContent] = useState<string>('');
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  const [activeSummary, setActiveSummary] = useState<ChatSummary | null>(null);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load Character & History (ASYNC)
+  useEffect(() => {
+    const init = async () => {
+        const chars = await loadCharacters();
+        const found = chars.find(c => c.id === charId);
+        if (found) {
+          setCharacter(found);
+          const history = await loadChat(found.id);
+          const summaryInfo = await loadChatSummary(found.id);
+          if (summaryInfo) {
+              setActiveSummary(summaryInfo);
+          }
+          
+          if (history.length > 0) {
+            // Ensure legacy messages have candidates structure AND IDs
+            const migrated = history.map(m => ({
+                ...m,
+                id: m.id || uuid(), // Ensure ID exists
+                candidates: m.candidates || [m.content],
+                thoughts: m.thoughts || (m.thought ? [m.thought] : []), // Migrate thoughts
+                currentIndex: m.currentIndex || 0
+            }));
+            setMessages(migrated);
+            setHasHistory(true);
+          } else {
+            // Fresh start
+            const initialMsg: Message = {
+                id: uuid(),
+                role: 'model',
+                content: found.firstMessage,
+                timestamp: Date.now(),
+                candidates: [found.firstMessage],
+                thoughts: [],
+                currentIndex: 0
+            };
+            setMessages([initialMsg]);
+            setHasHistory(false);
+          }
+        }
+    };
+    init();
+  }, [charId]);
+
+  // Auto-save (ASYNC)
+  useEffect(() => {
+    if (view === 'chat' && character) {
+        const timeoutId = setTimeout(() => {
+            saveChat(character.id, messages).catch(console.error);
+        }, 1000);
+        return () => clearTimeout(timeoutId);
+    }
+  }, [messages, view, character]);
+
+  // Sync state to Extensions System
+  useEffect(() => {
+    if (view === 'chat' && character) {
+        initExtensionSystem(settings);
+        syncActiveChatContext(character, messages, setMessages, async (text) => {
+            await handleSendMessage(text);
+        });
+        
+        // Notify extensions about character change
+        globalEventBus.emit(EVENT_TYPES.CHARACTER_CHANGED, character).catch(console.error);
+    }
+  }, [character, messages, view, settings]);
+
+  // Sync State to Bridge (SillyTavern-like Context Sync)
+  useEffect(() => {
+    if (view === 'chat' && character && settings.bridgeEnabled && settings.bridgeUrl) {
+        const syncState = async () => {
+            try {
+                const cleanUrl = settings.bridgeUrl.replace(/\/$/, '');
+                await fetch(`${cleanUrl}/sync-state`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        session_id: settings.bridgeSessionId,
+                        character: {
+                            name: character.name,
+                            description: character.description,
+                            personality: character.personality,
+                            scenario: character.scenario,
+                            firstMessage: character.firstMessage,
+                            lorebook: character.lorebook
+                        },
+                        messages: messages.map(m => ({
+                            role: m.role,
+                            content: m.candidates?.[m.currentIndex || 0] || m.content
+                        }))
+                    })
+                });
+            } catch (e) {
+                // Ignore sync errors to prevent console spam
+            }
+        };
+        
+        // Debounce sync to avoid spamming the server on rapid changes
+        const timeoutId = setTimeout(syncState, 1500);
+        return () => clearTimeout(timeoutId);
+    }
+  }, [messages, view, character, settings.bridgeEnabled, settings.bridgeUrl, settings.bridgeSessionId]);
+
+  // Scroll to bottom on new message (only if not editing/swiping history)
+  useEffect(() => {
+      if (view === 'chat' && !isLoading) {
+          messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }
+  }, [messages.length, view]);
+
+  const handleStartChat = () => {
+    setView('chat');
+  };
+
+  const handleResetChat = async (silent: boolean = false) => {
+    if (!silent && !showResetConfirm) {
+        setShowResetConfirm(true);
+        return;
+    }
+    
+    if (character) {
+        const initial: Message = { 
+            id: uuid(),
+            role: 'model', 
+            content: character.firstMessage, 
+            timestamp: Date.now(),
+            candidates: [character.firstMessage],
+            thoughts: [],
+            currentIndex: 0
+        };
+        setMessages([initial]);
+        setActiveSummary(null);
+        await saveChatSummary(character.id, null);
+        await deleteChat(character.id);
+        await saveChat(character.id, [initial]);
+        setHasHistory(false);
+        setShowResetConfirm(false);
+        if(!silent) {
+            setView('landing');
+        }
+    }
+  };
+
+  const processResponse = async (fullHistory: Message[], userInput: string, hiddenDirection?: string) => {
+      setIsLoading(true);
+      isLoadingRef.current = true;
+      try {
+        let promptToSend = userInput;
+        if (hiddenDirection) {
+            const directionPrompt = `[ARAHAN SISTEM (JANGAN DIBALAS SECARA EKSPLISIT, IKUTI SAJA ALURNYA): ${hiddenDirection}]`;
+            promptToSend = promptToSend ? `${promptToSend}\n\n${directionPrompt}` : directionPrompt;
+        }
+
+        // generateReply expects history EXCLUDING the new message
+        const baselineHistory = fullHistory.slice(0, -1);
+        const { content: replyContent, activeLoreIds } = await generateReply(baselineHistory, promptToSend, character!, settings, activeSummary);
+        
+        // Parse Thought
+        const { content, thought } = parseThoughtAndContent(replyContent);
+
+        // Extension Event hook: MESSAGE_RECEIVED (Allow extensions to check/mutate content)
+        let textToUse = content;
+        let thoughtToUse = thought;
+        try {
+          let replyObj = { role: 'model', content: content, thought: thought };
+          const modifiedReply = await globalEventBus.emit(EVENT_TYPES.MESSAGE_RECEIVED, replyObj);
+          if (modifiedReply) {
+            if (typeof modifiedReply.content === 'string') textToUse = modifiedReply.content;
+            if (typeof modifiedReply.thought === 'string') thoughtToUse = modifiedReply.thought;
+          }
+        } catch (err) {
+          console.error("Error in MESSAGE_RECEIVED extension dispatch:", err);
+        }
+
+        // Add new Model message
+        const botMsg: Message = { 
+            id: uuid(),
+            role: 'model', 
+            content: textToUse, 
+            thought: thoughtToUse, // Active thought
+            timestamp: Date.now(),
+            candidates: [textToUse],
+            thoughts: [thoughtToUse], // Store parallel to candidates
+            currentIndex: 0,
+            isThoughtExpanded: textToUse.trim() === '' && thoughtToUse.trim() !== '',
+            activeLoreIds: activeLoreIds
+        };
+        
+        // Use functional update to ensure we don't overwrite user message
+        setMessages(prev => [...prev, botMsg]);
+
+        // --- SMART LORE EXTRACTION ---
+        // Run in background to avoid blocking initial response display
+        setTimeout(async () => {
+             // Use full history including bot reply
+             const newLores = await extractNewLore([...fullHistory, botMsg], settings, character!);
+             if (newLores && newLores.length > 0) {
+                 const entriesToAdd: LorebookEntry[] = newLores.map(l => ({
+                     id: uuid(),
+                     keys: l.keys || [],
+                     entry: l.entry || "",
+                     enabled: true
+                 }));
+                 
+                 // Store as suggestions
+                 setSuggestedLores(prev => [...prev, ...entriesToAdd]);
+                 setNewLoreNotification(true);
+                 setTimeout(() => setNewLoreNotification(false), 5000);
+             }
+        }, 1000);
+
+      } catch (error: any) {
+        // Improved Error Handling: Inject error as a system message
+        const errorMessage = `[SYSTEM ERROR]: ${error.message || 'Terjadi kesalahan tidak dikenal saat menghubungi AI.'}`;
+        const errorMsg: Message = { 
+            id: uuid(),
+            role: 'model', 
+            content: errorMessage, 
+            timestamp: Date.now(),
+            candidates: [errorMessage],
+            currentIndex: 0
+        };
+        setMessages(prev => [...prev, errorMsg]);
+      } finally {
+        setIsLoading(false);
+        isLoadingRef.current = false;
+      }
+  };
+
+  const handleSendMessage = async (overrideContent?: string, hiddenDirection?: string) => {
+    let textToSend = typeof overrideContent === 'string' ? overrideContent : input;
+    if ((!textToSend.trim() && !hiddenDirection?.trim()) || !character || isLoadingRef.current) return;
+    
+    isLoadingRef.current = true;
+
+    // Extension Event hook: MESSAGE_SENDING (Allow extensions to check/modify prompt)
+    if (textToSend.trim()) {
+      try {
+        let msgObj = { role: 'user', content: textToSend };
+        const modifiedMsg = await globalEventBus.emit(EVENT_TYPES.MESSAGE_SENDING, msgObj);
+        if (modifiedMsg && typeof modifiedMsg.content === 'string') {
+          textToSend = modifiedMsg.content;
+        }
+      } catch (err) {
+        console.error("Error in MESSAGE_SENDING extension dispatch:", err);
+      }
+    }
+
+    let newHistory = [...messages];
+    
+    if (textToSend.trim()) {
+        const userMsg: Message = { 
+            id: uuid(),
+            role: 'user', 
+            content: textToSend, 
+            timestamp: Date.now(),
+            candidates: [textToSend],
+            currentIndex: 0
+        };
+        
+        newHistory = [...messages, userMsg];
+        setMessages(newHistory);
+        if (typeof overrideContent !== 'string') setInput('');
+
+        // Extension Event hook: MESSAGE_SENT (Notify extensions of sent message asynchronously)
+        globalEventBus.emit(EVENT_TYPES.MESSAGE_SENT, userMsg).catch(console.error);
+    }
+    
+    // Pass newHistory which includes the userMsg
+    await processResponse(newHistory, textToSend, hiddenDirection);
+  };
+
+  // --- LOREBOOK HANDLING ---
+
+  const handleSaveLorebook = async (newLorebook: LorebookEntry[]) => {
+      if (!character) return;
+      
+      const updatedChar = { ...character, lorebook: newLorebook };
+      setCharacter(updatedChar);
+
+      // Persist to DB immediately
+      try {
+          const allChars = await loadCharacters();
+          const updatedAllChars = allChars.map(c => c.id === character.id ? updatedChar : c);
+          await saveCharacters(updatedAllChars);
+      } catch (e) {
+          console.error("Failed to save lorebook changes", e);
+      }
+  };
+
+  const handleImportChat = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !character) return;
+
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+        const content = ev.target?.result as string;
+        let newMessages: Message[] = [];
+
+        try {
+            if (file.name.endsWith('.jsonl') || file.name.endsWith('.json')) {
+                newMessages = parseJSONL(content);
+            } else {
+                newMessages = parseTextChat(content, character.name);
+            }
+
+            if (newMessages.length > 0) {
+                 // Migrate structure & Ensure IDs
+                 const migrated = newMessages.map(m => ({
+                    ...m,
+                    id: m.id || uuid(),
+                    candidates: m.candidates || [m.content],
+                    currentIndex: m.currentIndex || 0
+                }));
+                setMessages(migrated);
+                await saveChat(character.id, migrated); 
+                setHasHistory(true);
+                alert(`Berhasil mengimpor ${newMessages.length} pesan!`);
+            } else {
+                alert('Gagal membaca pesan atau format tidak dikenali.');
+            }
+        } catch (err) {
+            console.error(err);
+            alert('Terjadi kesalahan saat memproses file.');
+        }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  const handleGenerateSummary = async () => {
+      const startIndex = activeSummary ? activeSummary.messageCount : 0;
+      const endIndex = startIndex + summaryMsgCount;
+      if (!character || messages.length <= startIndex) return;
+
+      setIsSummarizing(true);
+      try {
+          const messagesToSummarize = messages.slice(startIndex, endIndex);
+          const actualCount = messagesToSummarize.length;
+          if (actualCount === 0) return;
+
+          const textToSummarize = messagesToSummarize.map(m => `[${m.role.toUpperCase()}]: ${m.candidates?.[m.currentIndex || 0] || m.content}`).join('\n');
+          
+          let prompt = "";
+          const systemInstruction = "You are an expert lore and context summarizer. You summarize roleplay chats accurately in descriptive third-person format.";
+          
+          if (activeSummary) {
+              const cleanSummary = activeSummary.content.replace(/\n\n\[✓\] \d+ pesan awal berhasil diringkas\./, '');
+              prompt = `Berikut adalah ringkasan cerita sebelumnya:\n${cleanSummary}\n\nDan berikut adalah kelanjutan obrolannya:\n${textToSummarize}\n\nTolong PERBARUI ringkasan cerita di atas dengan merangkumnya secara kohesif, gabungkan kelanjutan obrolan dengan ringkasan sebelumnya. Pertahankan fakta penting, kejadian, dan perkembangan antar karakter. Jadikan dalam sudut pandang orang ketiga. JANGAN tambahkan penanda [✓]:`;
+          } else {
+              prompt = `Tolong buat ringkasan naratif yang padat dari obrolan ini untuk menghemat memori, mempertahankan fakta penting, kejadian, dan perkembangan antar karakter. Jadikan ringkasan dalam sudut pandang orang ketiga atau deskriptif. JANGAN tambahkan penanda [✓]:\n\n${textToSummarize}`;
+          }
+          
+          const result = await makeLLMRequest(
+              settings, 
+              [{ role: 'user', content: prompt }], 
+              systemInstruction,
+              false
+          );
+          setSummaryContent(result);
+      } catch (error: any) {
+          console.error("Summary error:", error);
+          alert("Gagal membuat ringkasan: " + error.message);
+      } finally {
+          setIsSummarizing(false);
+      }
+  };
+
+  const applySummary = async () => {
+      if (!character) return;
+      const startIndex = activeSummary ? activeSummary.messageCount : 0;
+      const actualCount = messages.slice(startIndex, startIndex + summaryMsgCount).length;
+      const newTotalCount = startIndex + actualCount;
+      
+      let finalContent = summaryContent;
+      if (!/\n\n\[✓\] \d+ pesan awal berhasil diringkas\./.test(finalContent)) {
+          finalContent += `\n\n[✓] ${newTotalCount} pesan awal berhasil diringkas.`;
+      }
+
+      const summaryToSave: ChatSummary = {
+          content: finalContent,
+          messageCount: newTotalCount
+      };
+      
+      setActiveSummary(summaryToSave);
+      await saveChatSummary(character.id, summaryToSave);
+      setShowSummaryModal(false);
+      setSummaryContent('');
+  };
+
+  const handleExportChat = (format: 'jsonl' | 'text') => {
+      if(!character) return;
+      let content = '';
+      const filename = `${character.name}_chat.${format === 'text' ? 'txt' : format}`;
+
+      // Use active content for export
+      const activeMessages = messages.map(m => ({
+          ...m,
+          content: m.candidates?.[m.currentIndex || 0] || m.content
+      }));
+
+      if (format === 'jsonl') {
+          content = exportToJSONL(activeMessages, character.name);
+      } else {
+          content = exportToText(activeMessages, character.name);
+      }
+
+      try {
+          const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.style.display = 'none';
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+              document.body.removeChild(a);
+              window.URL.revokeObjectURL(url);
+          }, 100);
+      } catch (e) {
+          console.error("Auto download failed", e);
+      }
+      
+      // Fallback: Selalu setelan link unduhan manual untuk browser seperti Via yang memblokir klik otomatis
+      const fallbackUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(content)}`;
+      setDownloadLink({ url: fallbackUrl, filename, content });
+  };
+
+  // --- BRANCHING, EDITING & THOUGHT FUNCTIONS ---
+
+  const requestDeleteMessage = (targetId: string) => {
+      setMsgToDelete(targetId);
+  };
+
+  const confirmDeleteMessage = async () => {
+      if (msgToDelete && character) {
+          const newMsgs = messages.filter(m => m.id !== msgToDelete);
+          setMessages(newMsgs);
+          await deleteMessage(character.id, msgToDelete);
+          setMsgToDelete(null);
+      }
+  };
+
+  const toggleThought = (msgId: string) => {
+      setMessages(messages.map(m => {
+          if (m.id === msgId) {
+              return { ...m, isThoughtExpanded: !m.isThoughtExpanded };
+          }
+          return m;
+      }));
+  };
+
+  const handleSwipe = (id: string, direction: 'left' | 'right') => {
+      setMessages(prev => prev.map(msg => {
+          if (msg.id !== id) return msg;
+          if (!msg.candidates) return msg;
+          
+          const current = msg.currentIndex || 0;
+          let next = direction === 'left' ? current - 1 : current + 1;
+          
+          // Loop around
+          if (next < 0) next = msg.candidates.length - 1;
+          if (next >= msg.candidates.length) next = 0;
+
+          return {
+              ...msg,
+              currentIndex: next,
+              content: msg.candidates[next],
+              thought: msg.thoughts && msg.thoughts.length > next ? msg.thoughts[next] : ''
+          };
+      }));
+  };
+
+  const handleStartEdit = (id: string) => {
+      const msg = messages.find(m => m.id === id);
+      if (!msg) return;
+      const activeContent = msg.candidates?.[msg.currentIndex || 0] || msg.content;
+      setEditContent(activeContent);
+      setEditingId(id);
+  };
+
+  const handleSaveEdit = (id: string) => {
+      setMessages(prev => prev.map(msg => {
+          if (msg.id !== id) return msg;
+          
+          const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+          const currentIndex = msg.currentIndex || 0;
+          candidates[currentIndex] = editContent;
+
+          return {
+              ...msg,
+              candidates,
+              content: editContent
+          };
+      }));
+      setEditingId(null);
+      setEditContent('');
+  };
+
+  const handleRegenerate = async (id: string) => {
+      if (isLoadingRef.current || !character) return;
+      
+      const index = messages.findIndex(m => m.id === id);
+      if (index === -1 || messages[index].role !== 'model') return;
+
+      setIsLoading(true);
+      isLoadingRef.current = true;
+      try {
+          let lastUserMsg = "";
+          const contextForGen: Message[] = [];
+          
+          if (index > 0) {
+             const prevMsg = messages[index - 1];
+             if (prevMsg.role === 'user') {
+                 lastUserMsg = prevMsg.candidates?.[prevMsg.currentIndex || 0] || prevMsg.content;
+                 contextForGen.push(...messages.slice(0, index - 1));
+             } else {
+                 contextForGen.push(...messages.slice(0, index));
+             }
+          }
+
+          const { content: replyContent, activeLoreIds } = await generateReply(contextForGen, lastUserMsg, character, settings, activeSummary);
+          const { content, thought } = parseThoughtAndContent(replyContent);
+          
+          setMessages(prev => {
+              const newMsgs = prev.map(msg => {
+                  if (msg.id !== id) return msg;
+                  
+                  const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+                  const thoughts = msg.thoughts ? [...msg.thoughts] : [msg.thought || ''];
+                  
+                  candidates.push(content);
+                  thoughts.push(thought);
+                  
+                  return {
+                      ...msg,
+                      candidates,
+                      thoughts,
+                      currentIndex: candidates.length - 1,
+                      content,
+                      thought,
+                      activeLoreIds: activeLoreIds
+                  };
+              });
+              return newMsgs;
+          });
+      } catch (e: any) {
+           const errorMsg = `[SYSTEM ERROR]: ${e.message || 'Gagal regenerasi respon.'}`;
+           setMessages(prev => prev.map(msg => {
+              if (msg.id !== id) return msg;
+              
+              const candidates = msg.candidates ? [...msg.candidates] : [msg.content];
+              candidates.push(errorMsg);
+              
+              return {
+                  ...msg,
+                  candidates,
+                  currentIndex: candidates.length - 1,
+                  content: errorMsg
+              };
+          }));
+      } finally {
+          setIsLoading(false);
+          isLoadingRef.current = false;
+      }
+  };
+
+  if (!character) return <div className="p-10 text-white">Memuat karakter...</div>;
+
+  // --- LANDING PAGE ---
+  if (view === 'landing') {
+    return (
+      <div className="h-full w-full relative bg-gray-900 overflow-y-auto custom-scrollbar">
+        <div 
+            className="fixed inset-0 z-0 opacity-30 bg-cover bg-center filter blur-xl scale-110 pointer-events-none"
+            style={{ backgroundImage: `url(${character.avatarUrl})` }}
+        />
+        <div className="fixed inset-0 z-0 bg-black/60 pointer-events-none" />
+        <div className="relative z-10 min-h-full flex items-center justify-center p-4 py-10">
+            <div className="w-full max-w-5xl bg-gray-850/90 border border-gray-700 rounded-3xl overflow-hidden shadow-2xl flex flex-col md:flex-row">
+                <div className="w-full md:w-5/12 relative group bg-black h-64 md:h-auto shrink-0">
+                    <img src={character.avatarUrl} alt={character.name} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition duration-700" />
+                    <div className="absolute inset-0 bg-gradient-to-t from-gray-900 via-transparent to-transparent"></div>
+                    <div className="absolute bottom-0 left-0 w-full p-6 bg-gradient-to-t from-black/90 to-transparent">
+                        <h1 className="text-3xl md:text-4xl font-bold text-white drop-shadow-lg mb-2 leading-tight">{character.name}</h1>
+                        {hasHistory ? (
+                            <div className="inline-flex items-center px-3 py-1 rounded-full bg-green-500/20 text-green-400 border border-green-500/30 text-xs font-bold"><i className="fas fa-history mr-2"></i> {messages.length} Pesan</div>
+                        ) : (
+                            <div className="inline-flex items-center px-3 py-1 rounded-full bg-primary-500/20 text-primary-400 border border-primary-500/30 text-xs font-bold"><i className="fas fa-star mr-2"></i> Chat Baru</div>
+                        )}
+                    </div>
+                </div>
+                <div className="w-full md:w-7/12 p-6 md:p-8 flex flex-col bg-gray-900/50 backdrop-blur-sm">
+                    <div className="mb-6 md:flex-1 md:overflow-y-auto md:pr-2 custom-scrollbar max-h-[400px] md:max-h-[60vh]">
+                        <div className="mb-6">
+                            <h3 className="text-gray-500 text-xs uppercase tracking-widest font-bold mb-3 flex items-center gap-2"><i className="fas fa-align-left"></i> Tentang Karakter</h3>
+                            <p className="text-gray-300 leading-7 text-sm whitespace-pre-wrap font-light border-l-2 border-gray-700 pl-4">{character.description}</p>
+                        </div>
+                        <div>
+                            <h3 className="text-gray-500 text-xs uppercase tracking-widest font-bold mb-3 flex items-center gap-2"><i className="fas fa-quote-left"></i> Pesan Pembuka</h3>
+                            <div className="bg-gray-800/50 p-5 rounded-xl text-gray-300 text-sm italic border border-gray-700/50">"{character.firstMessage.slice(0, 300)}{character.firstMessage.length > 300 ? '...' : ''}"</div>
+                        </div>
+                    </div>
+                    <div className="space-y-4 border-t border-gray-800 pt-6 mt-auto">
+                        <button onClick={handleStartChat} className={`w-full py-4 rounded-xl font-bold text-lg shadow-lg flex items-center justify-center gap-2 transition transform active:scale-95 ${hasHistory ? 'bg-green-600 hover:bg-green-500 text-white shadow-green-500/20' : 'bg-primary-600 hover:bg-primary-500 text-white shadow-primary-500/20'}`}>
+                            {hasHistory ? <><i className="fas fa-play"></i> Lanjutkan Chat</> : <><i className="fas fa-comments"></i> Mulai Obrolan</>}
+                        </button>
+                        <div className="grid grid-cols-3 gap-3">
+                            <div className="relative group col-span-1">
+                                <button onClick={() => fileInputRef.current?.click()} className="w-full bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 py-3 rounded-xl text-sm font-medium transition flex flex-col items-center justify-center gap-1 h-full min-h-[80px]"><i className="fas fa-file-import text-lg"></i><span>Impor</span></button>
+                                <input type="file" ref={fileInputRef} onChange={handleImportChat} accept=".json,.jsonl,.txt,application/json,text/plain,*/*" className="hidden" />
+                            </div>
+                             <div className="relative group col-span-1">
+                                <button className="w-full bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 py-3 rounded-xl text-sm font-medium transition flex flex-col items-center justify-center gap-1 h-full min-h-[80px]"><i className="fas fa-download text-lg"></i><span>Unduh</span></button>
+                                <div className="absolute bottom-full left-0 w-full mb-2 bg-gray-800 rounded-xl shadow-xl border border-gray-600 overflow-hidden opacity-0 group-hover:opacity-100 invisible group-hover:visible transition-all z-20">
+                                    <button onClick={() => handleExportChat('text')} className="block w-full text-left px-4 py-3 hover:bg-gray-700 text-xs text-white border-b border-gray-700">Teks (.txt)</button>
+                                    <button onClick={() => handleExportChat('jsonl')} className="block w-full text-left px-4 py-3 hover:bg-gray-700 text-xs text-white">JSONL</button>
+                                </div>
+                            </div>
+                            <button onClick={() => handleResetChat(false)} className="col-span-1 bg-gray-800 hover:bg-red-900/30 hover:border-red-500/50 hover:text-red-400 border border-gray-700 text-gray-300 py-3 rounded-xl text-sm font-medium transition flex flex-col items-center justify-center gap-1 h-full min-h-[80px]"><i className="fas fa-trash-alt text-lg"></i><span>Reset</span></button>
+                        </div>
+                        <div className="text-center mt-2"><Link to="/" className="text-gray-500 hover:text-white text-sm transition flex items-center justify-center gap-2"><i className="fas fa-arrow-left"></i> Kembali ke Daftar</Link></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- ACTIVE CHAT VIEW ---
+  return (
+    <div className="flex flex-col h-screen bg-[#0f0f12]">
+      {/* Chat Header */}
+      <header className="h-16 border-b border-gray-800 bg-gray-950/80 backdrop-blur flex items-center justify-between px-6 shrink-0 z-20">
+        <div className="flex items-center gap-4">
+            <button onClick={() => setView('landing')} className="text-gray-400 hover:text-white transition">
+                <i className="fas fa-chevron-left"></i>
+            </button>
+            <div className="w-10 h-10 rounded-full overflow-hidden border border-gray-700">
+                <img src={character.avatarUrl} alt="" className="w-full h-full object-cover" />
+            </div>
+            <div>
+                <h2 className="font-bold text-white text-lg leading-tight">{character.name}</h2>
+                <span className="text-xs text-green-500 flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> Online
+                </span>
+            </div>
+        </div>
+
+        <div className="flex items-center gap-2 relative">
+            {/* Suggested Lore Magic Button (If any) */}
+            {suggestedLores.length > 0 && (
+                <button 
+                  onClick={() => setShowSuggestedLoreModal(true)}
+                  className="relative group p-2 bg-amber-500/20 text-amber-500 rounded-lg animate-pulse hover:animate-none transition"
+                  title="Ada saran lore baru!"
+                >
+                    <i className="fas fa-magic"></i>
+                    <span className="absolute -top-1 -right-1 bg-white text-amber-600 text-[8px] font-black w-4 h-4 flex items-center justify-center rounded-full border border-amber-500">
+                        {suggestedLores.length}
+                    </span>
+                    <div className="absolute top-full right-0 mt-2 p-2 bg-amber-600 text-white text-[10px] rounded-md opacity-0 group-hover:opacity-100 transition whitespace-nowrap pointer-events-none z-50 font-bold shadow-xl">
+                       Tinjau saran lore baru ({suggestedLores.length})
+                    </div>
+                </button>
+            )}
+
+            {/* Lorebook Toggle Button */}
+            <button 
+                onClick={() => setIsLorebookOpen(true)}
+                className="text-gray-400 hover:text-primary-400 p-2 transition rounded-lg"
+                title="Buka Lorebook (World Info)"
+            >
+                <i className="fas fa-book"></i>
+            </button>
+
+            <button 
+                onClick={() => setShowMenu(!showMenu)} 
+                className={`text-gray-400 hover:text-white p-2 transition rounded-lg ${showMenu ? 'bg-gray-800 text-white' : ''}`}
+            >
+                <i className="fas fa-ellipsis-v"></i>
+            </button>
+            
+            {showMenu && (
+                <div className="absolute top-full right-0 mt-2 w-48 bg-gray-850 border border-gray-700 rounded-xl shadow-xl z-50 overflow-hidden animate-fade-in">
+                    <div className="p-2">
+                         <button 
+                            onClick={() => { setShowAdvancedControls(!showAdvancedControls); setShowMenu(false); }}
+                            className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 rounded-lg flex items-center justify-between"
+                        >
+                            <span>Mode Lanjutan</span>
+                            {showAdvancedControls ? <i className="fas fa-toggle-on text-primary-500"></i> : <i className="fas fa-toggle-off text-gray-500"></i>}
+                        </button>
+                        <div className="h-px bg-gray-700 my-1"></div>
+                        <button onClick={() => { setShowSummaryModal(true); setShowMenu(false); }} className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-amber-900/40 rounded-lg"><i className="fas fa-compress-alt mr-2 w-4 text-amber-500"></i> Ringkas Chat</button>
+                        <button onClick={() => { handleExportChat('jsonl'); setShowMenu(false); }} className="w-full text-left px-3 py-2 text-sm text-gray-300 hover:bg-gray-700 rounded-lg"><i className="fas fa-save mr-2 w-4"></i> Simpan Chat</button>
+                        <button onClick={() => { handleResetChat(); setShowMenu(false); }} className="w-full text-left px-3 py-2 text-sm text-red-400 hover:bg-red-900/30 rounded-lg"><i className="fas fa-trash mr-2 w-4"></i> Hapus Chat</button>
+                    </div>
+                </div>
+            )}
+        </div>
+      </header>
+
+      {/* Messages Area */}
+      <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6 scroll-smooth custom-scrollbar relative">
+        {/* DOM hook for SillyTavern extensions like TopInfoBar */}
+        <div id="top-bar" className="w-full flex justify-center empty:hidden z-[100] sticky top-0"></div>
+
+        {messages.map((msg, idx) => {
+            const isUser = msg.role === 'user';
+            const candidates = msg.candidates || [msg.content];
+            const currentIdx = msg.currentIndex || 0;
+            const activeContent = candidates[currentIdx];
+            const isEditing = editingId === msg.id;
+            const isError = activeContent.startsWith('[SYSTEM ERROR]:');
+
+            // Render Formatting Logic (Improved to support <details> and <font>)
+            const renderTextNodes = (text: string, isInline: boolean = false): React.ReactNode => {
+                // Match <font color="...">...</font> supporting single or double quotes
+                const fontRegex = /(<font\s+color=["'][^"']+["']>[\s\S]*?<\/font>)/gi;
+                const fontParts = text.split(fontRegex);
+
+                const renderInline = (inlineText: string) => {
+                    const inlineRegex = /(\*\*[\s\S]+?\*\*|\*[\s\S]+?\*)/g;
+                    const parts = inlineText.split(inlineRegex);
+                    return parts.map((part, i) => {
+                        if (!part) return null;
+                        if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+                            return <span key={i} className="text-white font-bold">{part.slice(2, -2)}</span>;
+                        } else if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+                            return <span key={i} className="text-gray-400 italic">{part.slice(1, -1)}</span>;
+                        } else {
+                            return <span key={i}>{part}</span>;
+                        }
+                    });
+                };
+
+                return fontParts.map((part, index) => {
+                    if (!part) return null;
+                    if (part.toLowerCase().startsWith('<font')) {
+                        const colorMatch = part.match(/color=["']([^"']+)["']/i);
+                        const color = colorMatch ? colorMatch[1] : 'inherit';
+                        const content = part.replace(/<font[^>]*>([\s\S]*?)<\/font>/i, '$1');
+                        
+                        return (
+                            <span key={index} style={{ color }}>
+                                {renderTextNodes(content, true)}
+                            </span>
+                        );
+                    } else {
+                        if (isInline) {
+                            return part.split('\n').map((line, i) => (
+                                <React.Fragment key={i}>
+                                    {i > 0 && <br />}
+                                    {renderInline(line)}
+                                </React.Fragment>
+                            ));
+                        } else {
+                            return part.split('\n').map((line, i) => (
+                                <p key={i} className="mb-2 min-h-[1rem] whitespace-pre-wrap text-gray-200">
+                                    {renderInline(line)}
+                                </p>
+                            ));
+                        }
+                    }
+                });
+            };
+
+            const renderContent = (text: string) => {
+                const parts: { type: string, content?: string, summary?: string, body?: string, html?: string }[] = [];
+                
+                // Regex to find <!-- GFX_START -->...<!-- GFX_END --> blocks containing raw HTML
+                const gfxRegex = /<!--\s*GFX_START\s*-->([\s\S]*?)<!--\s*GFX_END\s*-->/gi;
+                
+                // Regex to find standard <details> blocks
+                const detailsRegex = /<details>([\s\S]*?)<\/details>/gi;
+                
+                let remainingText = text;
+                
+                // 1. First Pass: Extract GFX/HTML Blocks
+                let match;
+                while ((match = gfxRegex.exec(remainingText)) !== null) {
+                    const before = remainingText.substring(0, match.index);
+                    if (before.trim()) parts.push({ type: 'text_chunk', content: before });
+                    
+                    parts.push({ type: 'html', html: match[1].trim() });
+                    
+                    remainingText = remainingText.substring(gfxRegex.lastIndex);
+                    gfxRegex.lastIndex = 0; // Reset index since we modified the string
+                }
+                
+                if (remainingText.trim()) parts.push({ type: 'text_chunk', content: remainingText });
+                
+                // 2. Second Pass: Process <details> tags inside the remaining text chunks
+                const finalParts: { type: string, content?: string, summary?: string, body?: string, html?: string }[] = [];
+                
+                for (let i = 0; i < parts.length; i++) {
+                    const chunk = parts[i];
+                    if (chunk.type === 'text_chunk') {
+                        let innerText = chunk.content || "";
+                        let detailsMatch;
+                        let lastIdx = 0;
+                        
+                        while ((detailsMatch = detailsRegex.exec(innerText)) !== null) {
+                            if (detailsMatch.index > lastIdx) {
+                                finalParts.push({ type: 'text', content: innerText.substring(lastIdx, detailsMatch.index) });
+                            }
+                            
+                            const detailsContent = detailsMatch[1];
+                            const summaryMatch = /<summary>([\s\S]*?)<\/summary>/i.exec(detailsContent);
+                            const summary = summaryMatch ? summaryMatch[1].trim() : 'Details';
+                            const body = detailsContent.replace(/<summary>[\s\S]*?<\/summary>/i, '').trim();
+                            
+                            finalParts.push({ type: 'details', summary, body });
+                            lastIdx = detailsRegex.lastIndex;
+                        }
+                        
+                        if (lastIdx < innerText.length) {
+                           finalParts.push({ type: 'text', content: innerText.substring(lastIdx) });
+                        }
+                        detailsRegex.lastIndex = 0;
+                    } else {
+                        // It's an HTML chunk, just push it directly
+                        finalParts.push(chunk);
+                    }
+                }
+
+                return finalParts.map((part, index) => {
+                    if (part.type === 'html') {
+                        return (
+                            <div key={index} className="my-4" dangerouslySetInnerHTML={{ __html: part.html || '' }} />
+                        );
+                    } else if (part.type === 'details') {
+                        return (
+                            <details key={index} className="my-3 bg-black/30 rounded-lg border border-gray-700/50 overflow-hidden shadow-inner">
+                                <summary className="cursor-pointer px-4 py-2 bg-gray-800/80 hover:bg-gray-700 font-bold text-gray-300 select-none outline-none flex items-center transition-colors">
+                                    <span className="flex-1">{part.summary}</span>
+                                </summary>
+                                <div className="p-4 text-sm text-gray-300 border-t border-gray-700/50">
+                                    {renderTextNodes(part.body || '')}
+                                </div>
+                            </details>
+                        );
+                    } else {
+                        return <div key={index}>{renderTextNodes(part.content || '')}</div>;
+                    }
+                });
+            };
+
+            return (
+                <div key={msg.id} className={`flex w-full group ${isUser ? 'justify-end' : 'justify-start'}`}>
+                    <div className={`flex flex-col max-w-[90%] md:max-w-[75%] ${isUser ? 'items-end' : 'items-start'}`}>
+                        
+                        <div className={`flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+                            {/* Avatar */}
+                            <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
+                                {isUser ? (
+                                    <div className="w-full h-full bg-gray-700 flex items-center justify-center text-xs text-gray-300">
+                                        <i className="fas fa-user"></i>
+                                    </div>
+                                ) : (
+                                    <img src={character.avatarUrl} className="w-full h-full object-cover" />
+                                )}
+                            </div>
+
+                            <div className="flex flex-col">
+                                {/* THOUGHT PROCESS BUBBLE */}
+                                {!isUser && msg.thought && (
+                                    <div className="mb-2 max-w-full bg-gray-900/80 border border-gray-700/50 rounded-xl overflow-hidden shadow-sm animate-fade-in self-start w-full">
+                                        <div 
+                                            onClick={() => toggleThought(msg.id)}
+                                            className="px-3 py-2 bg-gray-800/50 flex items-center justify-between cursor-pointer hover:bg-gray-800 transition"
+                                        >
+                                            <div className="flex items-center gap-2 text-xs font-bold text-gray-400">
+                                                <i className="fas fa-brain text-primary-500"></i>
+                                                Thought Process
+                                            </div>
+                                            <button className="text-gray-500 hover:text-white transition">
+                                                {msg.isThoughtExpanded ? <i className="fas fa-chevron-up"></i> : <i className="fas fa-chevron-down"></i>}
+                                            </button>
+                                        </div>
+                                        {msg.isThoughtExpanded && (
+                                            <div className="p-3 text-xs text-gray-400 font-mono italic leading-relaxed border-t border-gray-700/30 whitespace-pre-wrap bg-gray-950/30">
+                                                {msg.thought}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Message Bubble */}
+                                <div className={`
+                                    relative px-5 py-3 rounded-2xl text-sm md:text-base leading-relaxed shadow-md whitespace-pre-wrap min-w-[120px]
+                                    ${isError 
+                                        ? 'bg-red-900/50 border border-red-500 text-red-100 rounded-tl-none'
+                                        : (isUser 
+                                            ? 'bg-primary-600 text-white rounded-tr-none' 
+                                            : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-tl-none')
+                                    }
+                                `}>
+                                {isEditing ? (
+                                        <div className="w-full min-w-[200px]">
+                                            <textarea 
+                                                value={editContent}
+                                                onChange={(e) => setEditContent(e.target.value)}
+                                                className="w-full bg-black/20 text-white rounded p-2 text-sm outline-none border border-white/20"
+                                                rows={Math.max(3, editContent.split('\n').length)}
+                                            />
+                                            <div className="flex justify-end gap-2 mt-2">
+                                                <button onClick={() => setEditingId(null)} className="px-3 py-1 bg-gray-700 rounded hover:bg-gray-600 text-xs text-gray-300">Batal</button>
+                                                <button onClick={() => handleSaveEdit(msg.id)} className="px-3 py-1 bg-green-600 rounded hover:bg-green-500 text-white text-xs">Simpan</button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            {renderContent(activeContent)}
+                                            {!isUser && msg.activeLoreIds && msg.activeLoreIds.length > 0 && (
+                                                <div className={`mt-3 pt-2 border-t border-gray-700/50 flex flex-wrap gap-2 transition-all duration-300 ${visibleLoreMsgId === msg.id ? 'opacity-100 max-h-40 overflow-y-auto' : 'opacity-0 max-h-0 overflow-hidden'}`}>
+                                                    {msg.activeLoreIds.map(loreId => {
+                                                        const lore = character.lorebook?.find(l => l.id === loreId);
+                                                        if (!lore) return null;
+                                                        return (
+                                                            <div key={loreId} className="text-[10px] bg-amber-500/10 text-amber-500/80 px-2 py-1 rounded border border-amber-500/20 italic">
+                                                                <i className="fas fa-bookmark mr-1"></i> {lore.keys[0]}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Message Controls (Bottom of bubble) */}
+                        {showAdvancedControls && !isEditing && !isError && (
+                            <div className={`flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity ${isUser ? 'pr-12' : 'pl-12'}`}>
+                                
+                                {/* Branch Navigation */}
+                                {candidates.length > 1 && (
+                                    <div className="flex items-center bg-gray-800 rounded-md px-1 border border-gray-700">
+                                        <button onClick={() => handleSwipe(msg.id, 'left')} className="p-1 hover:text-white"><i className="fas fa-chevron-left"></i></button>
+                                        <span className="mx-2 font-mono">{currentIdx + 1}/{candidates.length}</span>
+                                        <button onClick={() => handleSwipe(msg.id, 'right')} className="p-1 hover:text-white"><i className="fas fa-chevron-right"></i></button>
+                                    </div>
+                                )}
+
+                                {/* Action Buttons */}
+                                <div className="flex items-center gap-1 bg-gray-800/50 rounded-md p-1">
+                                    {!isUser && msg.activeLoreIds && msg.activeLoreIds.length > 0 && (
+                                        <button 
+                                            onClick={() => setVisibleLoreMsgId(msg.id === visibleLoreMsgId ? null : msg.id)}
+                                            className={`p-1.5 transition ${msg.id === visibleLoreMsgId ? 'text-amber-400' : 'hover:text-amber-400'}`} 
+                                            title="Tampilkan Lorebook Aktif"
+                                        >
+                                            <i className="fas fa-book-sparkles text-[13px]"></i>
+                                            <span className="ml-1 text-[9px] bg-amber-500/20 text-amber-500 rounded-full px-1">{msg.activeLoreIds.length}</span>
+                                        </button>
+                                    )}
+                                    <button onClick={() => handleStartEdit(msg.id)} className="p-1.5 hover:text-primary-400 transition" title="Edit Pesan">
+                                        <i className="fas fa-pen"></i>
+                                    </button>
+                                    
+                                    {!isUser && (
+                                         <button onClick={() => handleRegenerate(msg.id)} className="p-1.5 hover:text-green-400 transition" title="Buat Ulang Jawaban">
+                                            <i className="fas fa-sync-alt"></i>
+                                        </button>
+                                    )}
+
+                                    <button onClick={() => requestDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition" title="Hapus Pesan">
+                                        <i className="fas fa-trash"></i>
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                        {/* Error Message Delete only */}
+                        {isError && (
+                             <div className="flex items-center gap-2 mt-1 text-gray-500 text-xs opacity-0 group-hover:opacity-100 transition-opacity pl-12">
+                                <button onClick={() => requestDeleteMessage(msg.id)} className="p-1.5 hover:text-red-400 transition bg-gray-800/50 rounded-md" title="Hapus Pesan Error">
+                                    <i className="fas fa-trash"></i>
+                                </button>
+                             </div>
+                        )}
+
+                    </div>
+                </div>
+            );
+        })}
+        
+        {isLoading && (
+             <div className="flex w-full justify-start">
+                 <div className="flex max-w-[85%] gap-3">
+                    <div className="shrink-0 w-8 h-8 rounded-full overflow-hidden mt-1 shadow-lg">
+                        <img src={character.avatarUrl} className="w-full h-full object-cover" />
+                    </div>
+                    <div className="bg-gray-800 border border-gray-700 px-5 py-4 rounded-2xl rounded-tl-none flex items-center gap-2">
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce"></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-100"></div>
+                        <div className="w-2 h-2 bg-gray-500 rounded-full animate-bounce delay-200"></div>
+                    </div>
+                 </div>
+             </div>
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      <div className="p-4 bg-gray-950 border-t border-gray-800 shrink-0">
+        {/* Dynamic extension mount points in full SillyTavern style */}
+        <div className="max-w-4xl mx-auto space-y-2 mb-2">
+            <div id="chat-extension-bar" className="flex flex-wrap gap-2 text-xs"></div>
+            <div id="chat-extension-zone" className="w-full"></div>
+        </div>
+        <div className="max-w-4xl mx-auto relative">
+            <textarea
+                id="chat-input-textarea"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                    }
+                }}
+                disabled={isLoading}
+                placeholder={`Kirim pesan ke ${character?.name || 'Karakter'}...`}
+                className="w-full bg-gray-900 text-white rounded-xl border border-gray-700 p-4 pr-14 focus:ring-2 focus:ring-primary-500 focus:border-transparent outline-none resize-none shadow-inner h-[80px] custom-scrollbar" 
+            />
+            <button 
+                onClick={() => handleSendMessage()}
+                disabled={isLoading || !input.trim()}
+                className="absolute right-3 bottom-3 p-2 bg-primary-600 hover:bg-primary-500 disabled:bg-gray-700 disabled:cursor-not-allowed text-white rounded-lg transition-all shadow-lg"
+            >
+                <i className="fas fa-paper-plane"></i>
+            </button>
+        </div>
+        <p className="text-center text-xs text-gray-600 mt-2">
+            AI dapat membuat kesalahan. Periksa informasi penting.
+        </p>
+      </div>
+
+      {/* NEW LORE NOTIFICATION (Smart Discovery) */}
+      {newLoreNotification && (
+          <div className="fixed top-20 right-4 z-50 animate-fade-in-left">
+              <div 
+                className="bg-amber-600 hover:bg-amber-500 text-white px-5 py-4 rounded-2xl shadow-2xl flex items-center gap-4 border border-amber-400/30 cursor-pointer transition transform hover:scale-105 active:scale-95"
+                onClick={() => { setShowSuggestedLoreModal(true); setNewLoreNotification(false); }}
+              >
+                  <div className="bg-white/20 p-2 rounded-xl">
+                      <i className="fas fa-magic text-lg"></i>
+                  </div>
+                  <div>
+                      <h4 className="font-bold text-sm tracking-tight text-white/90">Wawasan Baru Teridentifikasi ✨</h4>
+                      <p className="text-[10px] text-white/80 leading-tight">Klik untuk meninjau dan menambahkan ke Lorebook.</p>
+                  </div>
+                  <div className="ml-2 bg-amber-800/40 w-6 h-6 flex items-center justify-center rounded-full text-[10px] font-bold">
+                    {suggestedLores.length}
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* SUGGESTED LORE MODAL */}
+      {showSuggestedLoreModal && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in" onClick={() => setShowSuggestedLoreModal(false)}>
+              <div className="bg-gray-900 border border-amber-500/30 rounded-3xl w-full max-w-xl shadow-2xl overflow-hidden animate-bounce-in flex flex-col max-h-[80vh]" onClick={e => e.stopPropagation()}>
+                    <div className="bg-amber-500/10 px-8 py-5 border-b border-amber-500/20 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="bg-amber-500/20 p-2 rounded-lg text-amber-500">
+                                <i className="fas fa-magic"></i>
+                            </div>
+                            <h3 className="text-amber-400 font-bold uppercase tracking-widest text-sm">
+                                Tinjau Lore Baru
+                            </h3>
+                        </div>
+                        <button onClick={() => setShowSuggestedLoreModal(false)} className="text-gray-400 hover:text-white transition p-2">
+                            <i className="fas fa-times"></i>
+                        </button>
+                    </div>
+                    
+                    <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-4">
+                        {suggestedLores.length === 0 ? (
+                            <div className="text-center py-10">
+                                <i className="fas fa-check-circle text-4xl text-gray-700 mb-4"></i>
+                                <p className="text-gray-500">Semua wawasan telah ditinjau.</p>
+                            </div>
+                        ) : (
+                            suggestedLores.map((lore, index) => (
+                                <div key={lore.id} className="bg-gray-850 p-5 rounded-2xl border border-gray-800 hover:border-amber-500/20 transition group">
+                                    <div className="flex flex-wrap gap-2 mb-3">
+                                        {lore.keys.map((k, i) => (
+                                            <span key={i} className="text-[10px] font-bold bg-amber-500/10 text-amber-500 px-2.5 py-1 rounded-lg border border-amber-500/20 uppercase tracking-tighter">
+                                                {k}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    <p className="text-sm text-gray-300 leading-relaxed mb-4 italic pl-4 border-l-2 border-amber-500/20">
+                                        "{lore.entry}"
+                                    </p>
+                                    <div className="flex justify-end gap-2">
+                                        <button 
+                                            onClick={() => setSuggestedLores(prev => prev.filter(l => l.id !== lore.id))}
+                                            className="px-4 py-2 text-xs font-bold text-gray-500 hover:text-red-400 transition"
+                                        >
+                                            Abaikan
+                                        </button>
+                                        <button 
+                                            onClick={async () => {
+                                                const updatedEntries = [...(character?.lorebook || []), lore];
+                                                await handleSaveLorebook(updatedEntries);
+                                                setSuggestedLores(prev => prev.filter(l => l.id !== lore.id));
+                                            }}
+                                            className="px-5 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/20 flex items-center gap-2"
+                                        >
+                                            <i className="fas fa-plus"></i> Tambah ke Lorebook
+                                        </button>
+                                    </div>
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    <div className="bg-gray-800/30 p-6 border-t border-gray-800 flex justify-between items-center">
+                        <p className="text-xs text-gray-500">AI mendeteksi fakta baru berdasarkan perkembangan cerita.</p>
+                        <button onClick={() => setShowSuggestedLoreModal(false)} className="px-6 py-2 bg-gray-800 hover:bg-gray-700 rounded-xl text-xs font-bold text-gray-300 transition">
+                            Tutup
+                        </button>
+                    </div>
+              </div>
+          </div>
+      )}
+
+      {/* LORE ACTIVITY TRACKER MODAL (SillyTavern style) */}
+      {visibleLoreMsgId && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in" onClick={() => setVisibleLoreMsgId(null)}>
+              <div className="bg-gray-900 border border-amber-500/30 rounded-2xl w-full max-w-lg shadow-2xl overflow-hidden animate-bounce-in" onClick={e => e.stopPropagation()}>
+                   <div className="bg-amber-500/10 px-6 py-4 border-b border-amber-500/20 flex items-center justify-between">
+                       <h3 className="text-amber-400 font-bold uppercase tracking-wider flex items-center gap-2">
+                           <i className="fas fa-book-sparkles"></i>
+                           Lore Terdeteksi untuk Pesan Ini
+                       </h3>
+                       <button onClick={() => setVisibleLoreMsgId(null)} className="text-gray-400 hover:text-white transition p-2">
+                           <i className="fas fa-times"></i>
+                       </button>
+                   </div>
+                   <div className="max-h-[60vh] overflow-y-auto custom-scrollbar p-6 space-y-4">
+                       {messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds?.map(loreId => {
+                           const lore = character.lorebook?.find(l => l.id === loreId);
+                           if (!lore) return null;
+                           return (
+                               <div key={loreId} className="bg-gray-850 p-4 rounded-xl border border-gray-800 hover:border-amber-500/30 transition shadow-inner">
+                                   <div className="flex flex-wrap gap-1.5 mb-3">
+                                       {lore.keys.map((k, ki) => (
+                                           <span key={ki} className="text-[9px] font-bold bg-primary-500/20 text-primary-400 px-2 py-0.5 rounded border border-primary-500/30 uppercase">
+                                               {k}
+                                           </span>
+                                       ))}
+                                   </div>
+                                   <p className="text-sm text-gray-300 leading-relaxed italic border-l-2 border-amber-500/30 pl-3">"{lore.entry}"</p>
+                               </div>
+                           );
+                       })}
+                       {(!messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds || messages.find(m => m.id === visibleLoreMsgId)?.activeLoreIds?.length === 0) && (
+                           <div className="text-center py-10 text-gray-500">Tidak ada lore yang aktif untuk pesan ini.</div>
+                       )}
+                   </div>
+                   <div className="bg-gray-800/30 p-4 border-t border-gray-800 text-center">
+                        <button onClick={() => setVisibleLoreMsgId(null)} className="px-8 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm font-bold text-gray-300 transition border border-gray-700">
+                            Tutup
+                        </button>
+                   </div>
+              </div>
+          </div>
+      )}
+
+      {/* LOREBOOK MODAL */}
+      <LorebookModal 
+          isOpen={isLorebookOpen}
+          onClose={() => setIsLorebookOpen(false)}
+          lorebook={character.lorebook || []}
+          onSave={handleSaveLorebook}
+          settings={settings}
+      />
+
+      {/* COLLABORATIVE BRIDGE (MODE C) */}
+      <CollaborativeBridge 
+          settings={settings}
+          character={character}
+          onInjectDirection={(direction) => handleSendMessage('', direction)}
+          onInjectUserMessage={(message) => handleSendMessage(message)}
+          lastCharacterMessage={messages.length > 0 && messages[messages.length - 1].role === 'model' ? messages[messages.length - 1] : null}
+      />
+
+      {/* MANUAL DOWNLOAD MODAL (FOR MOBILE BROWSER COMPATIBILITY) */}
+      {downloadLink && (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in" onClick={() => setDownloadLink(null)}>
+              <div className="bg-gray-900 border border-primary-500/30 rounded-3xl w-full max-w-sm shadow-2xl overflow-hidden animate-bounce-in flex flex-col" onClick={e => e.stopPropagation()}>
+                    <div className="px-6 py-6 text-center space-y-4">
+                        <div className="w-16 h-16 bg-primary-500/10 text-primary-500 rounded-full flex items-center justify-center mx-auto mb-2 shadow-inner">
+                           <i className="fas fa-file-download text-3xl"></i>
+                        </div>
+                        <h3 className="text-xl font-bold text-white tracking-tight">Unduh Tersedia</h3>
+                        <p className="text-sm text-gray-400">Beberapa sistem mencegah unduhan otomatis. Klik tombol di bawah ini atau salin isinya.</p>
+                        
+                        <a 
+                           href={downloadLink.url} 
+                           download={downloadLink.filename}
+                           className="block w-full py-3.5 bg-primary-600 hover:bg-primary-500 text-white rounded-xl text-sm font-bold shadow-lg shadow-primary-900/20 transition text-center"
+                           onClick={() => setTimeout(() => setDownloadLink(null), 1000)}
+                        >
+                            <i className="fas fa-download mr-2"></i> Ketuk Untuk Mengunduh
+                        </a>
+
+                        <button 
+                            onClick={async () => {
+                                try {
+                                    await navigator.clipboard.writeText(downloadLink.content);
+                                    alert("Isi chat berhasil disalin ke clipboard!");
+                                    setDownloadLink(null);
+                                } catch (e) {
+                                    alert("Gagal menyalin. Silakan unduh file secara manual.");
+                                }
+                            }}
+                            className="block w-full py-3 border border-gray-700 bg-gray-800 hover:bg-gray-750 text-white text-sm rounded-xl font-bold transition text-center mt-2 group"
+                        >
+                            <i className="fas fa-copy mr-2 text-gray-400 group-hover:text-white transition"></i> Salin sebagai Teks
+                        </button>
+                    </div>
+                    
+                    <div className="bg-gray-800/30 p-4 border-t border-gray-800 flex justify-center items-center relative">
+                        <button onClick={() => setDownloadLink(null)} className="px-6 py-2.5 bg-transparent hover:bg-gray-800 rounded-xl text-sm font-medium text-gray-400 transition w-full">
+                            Batal
+                        </button>
+                    </div>
+              </div>
+          </div>
+      )}
+
+      {/* SUMMARY MODAL */}
+      {showSummaryModal && (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in" onClick={() => setShowSummaryModal(false)}>
+              <div className="bg-gray-900 border border-amber-500/30 rounded-3xl w-full max-w-lg shadow-2xl overflow-hidden animate-bounce-in flex flex-col" onClick={e => e.stopPropagation()}>
+                    <div className="px-6 py-6 space-y-4">
+                        <div className="flex items-center gap-3 border-b border-gray-800 pb-4">
+                            <i className="fas fa-compress-alt text-2xl text-amber-500"></i>
+                            <div>
+                                <h3 className="text-xl font-bold text-white tracking-tight">Ringkas Pesan (Context Management)</h3>
+                                <p className="text-xs text-gray-400">Ringkas pesan awal menjadi 1 memori untuk menghemat kuota konteks.</p>
+                            </div>
+                        </div>
+                        
+                        <div className="space-y-3">
+                            <label className="text-sm font-medium text-gray-300">Pilih jumlah pesan {activeSummary ? 'selanjutnya' : 'awal'} yang akan diringkas:</label>
+                            <div className="grid grid-cols-3 gap-2">
+                                {[10, 15, 20].map(num => (
+                                    <button 
+                                        key={num}
+                                        onClick={() => setSummaryMsgCount(num)}
+                                        className={`py-2 rounded-xl text-sm font-medium transition ${summaryMsgCount === num ? 'bg-amber-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}
+                                    >
+                                        {num} Pesan
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        {summaryContent ? (
+                            <div className="space-y-2 mt-4 animate-fade-in">
+                                <label className="text-sm font-medium text-amber-500"><i className="fas fa-check-circle mr-1"></i> Hasil Ringkasan (Bisa diedit):</label>
+                                <textarea
+                                    value={summaryContent}
+                                    onChange={(e) => setSummaryContent(e.target.value)}
+                                    className="w-full h-40 bg-gray-950 border border-gray-700 rounded-xl p-3 text-sm text-gray-300 focus:border-amber-500 focus:ring-1 focus:ring-amber-500 outline-none flex-1 custom-scrollbar resize-none"
+                                />
+                            </div>
+                        ) : (
+                            <div className="bg-amber-900/10 border border-amber-500/20 rounded-xl p-4 mt-4 space-y-3">
+                                {activeSummary ? (
+                                    <div className="p-3 bg-gray-950/50 border border-amber-500/30 rounded-lg">
+                                        <p className="text-xs font-bold text-amber-500 mb-1"><i className="fas fa-history"></i> Ringkasan Aktif ({activeSummary.messageCount} Pesan):</p>
+                                        <p className="text-xs text-gray-300 line-clamp-3 italic mb-2">"{activeSummary.content}"</p>
+                                        <p className="text-xs text-gray-400">Sistem akan melanjutkan membaca {summaryMsgCount} pesan berikutnya (mulai dari pesan ke-{activeSummary.messageCount + 1}), lalu digabungkan dengan ringkasan di atas.</p>
+                                    </div>
+                                ) : (
+                                    <p className="text-sm text-gray-300">Sistem akan membaca {summaryMsgCount} pesan paling awal, mengirimnya ke AI untuk diringkas, lalu menjadikan ringkasan tersebut sebagai memori latar belakang.</p>
+                                )}
+                                <p className="text-xs text-amber-500"><i className="fas fa-eye"></i> Pesan asli di UI TIDAK AKAN dihapus, hanya sistem AI yang akan mengabaikannya untuk menghemat token memori.</p>
+                            </div>
+                        )}
+                    </div>
+                    
+                    <div className="bg-gray-800/30 p-4 border-t border-gray-800 flex justify-end items-center gap-3">
+                        <button onClick={() => { setShowSummaryModal(false); setSummaryContent(''); }} className="px-5 py-2.5 bg-transparent hover:bg-gray-700 rounded-xl text-sm font-medium text-gray-400 transition" disabled={isSummarizing}>
+                            Batal
+                        </button>
+                        {summaryContent ? (
+                            <button onClick={applySummary} className="px-5 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-sm font-bold shadow-lg shadow-amber-900/20 transition flex items-center gap-2">
+                                <i className="fas fa-check"></i> Terapkan Ringkasan
+                            </button>
+                        ) : (
+                            <button onClick={handleGenerateSummary} disabled={isSummarizing || messages.length <= (activeSummary ? activeSummary.messageCount : 0)} className={`px-5 py-2.5 bg-amber-600 ${isSummarizing || messages.length <= (activeSummary ? activeSummary.messageCount : 0) ? 'opacity-50 cursor-not-allowed' : 'hover:bg-amber-500'} text-white rounded-xl text-sm font-bold shadow-lg shadow-amber-900/20 transition flex items-center gap-2`}>
+                                {isSummarizing ? <i className="fas fa-circle-notch fa-spin"></i> : <i className="fas fa-magic"></i>} Buat Ringkasan
+                            </button>
+                        )}
+                    </div>
+              </div>
+          </div>
+      )}
+
+      <ConfirmModal
+          isOpen={showResetConfirm}
+          title="Hapus Riwayat Chat"
+          message="Hapus semua riwayat chat dengan karakter ini? Tindakan ini tidak dapat dibatalkan."
+          onConfirm={() => handleResetChat(true)}
+          onCancel={() => setShowResetConfirm(false)}
+      />
+
+      <ConfirmModal
+          isOpen={!!msgToDelete}
+          title="Hapus Pesan"
+          message="Hapus pesan ini? Tindakan ini tidak dapat dibatalkan."
+          onConfirm={confirmDeleteMessage}
+          onCancel={() => setMsgToDelete(null)}
+      />
+    </div>
+  );
+};
+
+export default ChatPage;

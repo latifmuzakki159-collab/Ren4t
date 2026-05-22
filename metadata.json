@@ -1,0 +1,5 @@
+{
+  "name": "Remix: 2 max share 1.2",
+  "description": "Aplikasi roleplay chat canggih mirip JanitorAI/SillyTavern yang ditenagai oleh Google Gemini API. Fitur termasuk manajemen karakter, jailbreak custom, dan impor riwayat chat.",
+  "requestFramePermissions": []
+}
